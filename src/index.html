@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YOLO Face 감지</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; display: grid; gap: 16px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; cursor: pointer; background: transparent; }
+    .panel { display: grid; gap: 10px; }
+    #result { width: 100%; max-width: 960px; border: 1px solid #ddd; border-radius: 12px; }
+    .stat { font-size: 13px; opacity: .8; }
+    /* 내 카메라 프리뷰는 완전히 숨김 */
+    #cam { opacity: 0; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <button id="startBtn">시작</button>
+    <button id="stopBtn">정지</button>
+    <span class="stat" id="status">대기 중</span>
+  </div>
+
+  <div class="panel">
+    <h3 style="margin:0;">서버 추론 결과</h3>
+    <img id="result" alt="annotated result will appear here" />
+    <div class="stat" id="stats">보낸: 0, 받은: 0, 지연: - ms</div>
+  </div>
+
+  <!-- 숨겨진 비디오(카메라), 캔버스는 JS에서 생성 -->
+  <video id="cam" autoplay playsinline muted></video>
+
+  <script>
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const statusEl = document.getElementById('status');
+  const statsEl  = document.getElementById('stats');
+  const imgEl    = document.getElementById('result');
+  const videoEl  = document.getElementById('cam');
+
+  let stream = null;
+  let ws = null;
+  let running = false;
+  let canvas = null, ctx = null;
+  let inflight = false;
+  let sent = 0, recv = 0;
+  let tSend = 0;
+
+  // HTTPS면 wss, 아니면 ws
+  const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+  const WS_URL  = `${wsProto}://${location.host}/ws/infer`;
+
+  function setStatus(t){ statusEl.textContent = t; }
+
+  function updateStats(rttMs = null){
+    const rtt = (rttMs == null) ? '-' : Math.max(0, Math.round(rttMs));
+    statsEl.textContent = `보낸: ${sent}, 받은: ${recv}, 지연: ${rtt} ms`;
+  }
+
+  async function startCamera(){
+    if (stream) return;
+    // 해상도 지정 없음: 브라우저/디바이스 기본값, 원본 비율 유지
+    stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    videoEl.srcObject = stream;
+
+    // 메타데이터 로드 후 원본 크기로 캔버스 설정 → 비율 유지
+    await new Promise(res => {
+      if (videoEl.readyState >= 2) return res();
+      videoEl.onloadedmetadata = () => res();
+    });
+
+    canvas = document.createElement('canvas');
+    canvas.width  = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    ctx = canvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  function stopCamera(){
+    if (stream){
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    videoEl.srcObject = null;
+  }
+
+  function openSocket(){
+    const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+    const url = `${wsProto}://${location.host}/ws/infer`;
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+
+
+    ws.onopen = () => {
+      setStatus('연결됨');
+      loopSend();
+    };
+
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer){
+        const blob = new Blob([ev.data], { type: 'image/jpeg' });
+        const url  = URL.createObjectURL(blob);
+        imgEl.src  = url;
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+        recv++;
+        // 왕복 시간 추정
+        const rttMs = performance.now() - tSend;
+        updateStats(rttMs);
+        inflight = false; // 다음 프레임 전송 허용
+      } else {
+        // 텍스트 로그(서버 'ready' 등)
+        console.log('[WS]', ev.data);
+      }
+    };
+
+    ws.onerror = (e) => {
+      console.error('[WS error]', e);
+      setStatus('오류');
+    };
+
+    ws.onclose = () => {
+      setStatus('연결 종료');
+      if (running) {
+        // 간단 재연결
+        setTimeout(openSocket, 800);
+      }
+    };
+  }
+
+  async function loopSend(){
+    if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (!stream || inflight) return setTimeout(loopSend, 16);
+
+    try {
+      inflight = true;
+      // 원본 비율 그대로 캡처
+      ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', 0.8));
+      if (blob && ws.readyState === WebSocket.OPEN){
+        sent++;
+        tSend = performance.now();
+        updateStats(); // 보낸/받은 카운터 즉시 반영
+        ws.send(blob);
+      } else {
+        inflight = false;
+      }
+    } catch (e) {
+      console.error('send error', e);
+      inflight = false;
+    } finally {
+      // 서버 응답 후 onmessage에서 inflight=false
+      setTimeout(loopSend, 0);
+    }
+  }
+
+  startBtn.onclick = async () => {
+    if (running) return;
+    try {
+      setStatus('카메라 요청...');
+      await startCamera();         // 권한 요청 + 원본 크기 설정
+      running = true;
+      setStatus('연결 중...');
+      openSocket();                // wss/ws 자동
+    } catch (e) {
+      console.error(e);
+      setStatus('카메라 접근 실패 (HTTPS 필요)');
+      alert('카메라 권한 또는 HTTPS 환경을 확인해주세요.\n(내 PC에서는 http://localhost 예외 허용)');
+    }
+  };
+
+  stopBtn.onclick = () => {
+    running = false;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+    ws = null;
+    inflight = false;
+    stopCamera();
+    setStatus('중지됨');
+  };
+  </script>
+</body>
+</html>

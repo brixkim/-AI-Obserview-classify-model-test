@@ -1,0 +1,6 @@
+/.venv
+*.pem
+__pycache__
+test_index.html
+test.py
+.DS_store

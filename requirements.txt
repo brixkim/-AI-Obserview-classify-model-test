@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+websockets
+opencv_python
+ultralytics
+onnx
+onnxruntime
